@@ -1,6 +1,63 @@
 # FuzzCache
 FuzzCache is a software-based data cache mechanism that complements and optimizes dynamic web application fuzzing. It is based on a key observation that data fetch is often repeated, redundant, yet expensive during web application fuzzing. FuzzCache thus stores the data into software-based in-memory caches, eliminating the need for repeated and expensive operations. More technical details can be found in the paper.
 
+In this repository, we provide the tool for profiling the execution dynamics of server-side web applications, and a data cache that transparently accelerates `mysqli`/PDO/`curl` calls during fuzzing.
+
+## Prerequisites
+- PHP with development headers/tools (`phpize`, `php-config`) and a C build toolchain (`cc`/`gcc`, `make`, `autoconf`, `libtool`) — e.g. the `php-dev` package on Debian/Ubuntu, `php-devel` on RHEL/Fedora, or `brew install php` on macOS (bundles these already).
+- The `mysqli`, `pdo_mysql`, and `curl` PHP extensions enabled. The cache extension itself doesn't hard-depend on them to build or load, but there is nothing to cache without them.
+- A MySQL or MariaDB server, for the demo database and the test suite.
+- The `mysql` CLI client (optional) — two tests use it to prove genuine caching by mutating data completely outside the extension; they skip gracefully if it's absent.
+- XHProf, only if you want the separate profiling workflow below — see its own install instructions.
+
+Nothing here is scripted (no installer, no Dockerfile); setup is the manual steps below.
+
+## Profiling
+We used XHProf to profile the function-level execution dynamics of server-side web applications. At profiling time, XHProf records the execution statistic per request in a file. After profiling, its web interface reads the files and sorts it in a user-friendly form.
+
+Install XHProf following the standard procedures listed [here](https://github.com/longxinH/xhprof/tree/master#installation), and then leverage a web scanner or fuzzer at your own preference to profile the web application. [Black-Widow](https://github.com/SecuringWeb/BlackWidow) is a good choice. To enable XHprof on the server side, one should first set up the environments/configurations at the beginning of serving requests. We provide an example at `xhprof/xhprof_enable.php`. The user should find an appropriate place to include the script so that it is always executed before processing requests. One can also try use preload functionality of PHP to realize this goal.
+
+Using a browser to visit the web interface of XHProf, e.g., http://localhost/xhprof/xhprof_html/index.php (assuming you have installed xhprof_html under the document root of Apache), scroll down to the bottom, and the collected data can be viewed there.
+
+## Data cache
+FuzzCache's data cache lives in `ext` as a PHP extension. It hooks the Zend engine's function-dispatch layer directly, so it works against an **unmodified** application — no wrapper functions, no source rewriting, just loading the extension. It caches:
+- `mysqli` reads (procedural and OOP: `mysqli_query()` and `$mysqli->query()`), with a lazy connection that's only ever established on a genuine cache miss;
+- PDO reads (`$pdo->query()` and `$pdo->prepare()`+`execute($params)`); any usage it can't safely reason about (e.g. `bindValue`/`bindParam`) transparently falls back to normal, uncached behavior rather than risking incorrect results;
+- `curl_exec()` responses, keyed by URL.
+
+Writes always run for real and invalidate the cache at table granularity. The cache lives in shared memory, so it persists across the independent, short-lived processes that serve fuzzing requests.
+
+See `ext/README.md` for build instructions, configuration, and known limitations.
+
+### Demo
+All commands below assume your shell is at the repo root.
+
+1. Install a database, then create the `test` / `123456` demo user and import the schema:
+    ```sh
+    mysql -u root -e "CREATE USER IF NOT EXISTS 'test'@'localhost' IDENTIFIED BY '123456'; CREATE DATABASE IF NOT EXISTS cachedb; GRANT ALL PRIVILEGES ON cachedb.* TO 'test'@'localhost'; FLUSH PRIVILEGES;"
+    mysql -u test -p123456 cachedb < examples/db.sql
+    ```
+    (adjust the `root` invocation for however your MySQL install expects admin access)
+2. Build the extension once:
+    ```sh
+    (cd ext && phpize && ./configure --enable-fuzzcache && make)
+    ```
+3. Run the unmodified demo script with and without the extension:
+    ```sh
+    php examples/demo.php
+    # Using time (10000 rounds)
+    # 0.7...
+
+    php -d extension=ext/modules/fuzzcache.so examples/demo.php
+    # Using time (10000 rounds)
+    # 0.01...
+    ```
+    Note that the actual time would differ on different machines.
+
+## License
+FuzzCache's own code is released under the [MIT License](LICENSE). The vendored `xhprof/` subproject is a separate project under its own license (Apache License 2.0) — see `xhprof/LICENSE`.
+
+## Citation
 ```tex
 @inproceedings{fuzzcache,
     title       = {FuzzCache: Optimizing Web Application Fuzzing Through Software-Based Data Cache},
@@ -10,58 +67,3 @@ FuzzCache is a software-based data cache mechanism that complements and optimize
     year        = 2024
 }
 ```
-
-In this repository, we provide the tool for profiling the execution dynamics of server-side web applications, and also a library for performing cross-request data cache.
-
-## Profiling
-We used XHProf to profile the function-level execution dynamics of server-side web applications. At profiling time, XHProf records the execution statistic per request in a file. After profiling, its web interface reads the files and sorts it in a user-friendly form.
-
-Install XHProf following the standard procedures listed [here](https://github.com/longxinH/xhprof/tree/master#installation), and then leverage a web scanner or fuzzer at your own preference to profile the web application. [Black-Widow](https://github.com/SecuringWeb/BlackWidow) is a good choice. To enable XHprof on the server side, one should first set up the environments/configurations at the beginning of serving requests. We provide an example at `utils/xhprof_enable.php`. The user should find an appropriate place to include the script so that it is always executed before processing requests. One can also try use preload functionality of PHP to realize this goal.
-
-Using a browser to visit the web interface of XHProf, e.g., http://localhost/xhprof/xhprof_html/index.php (assuming you have installed xhprof_html under the document root of Apache), scroll down to the bottom, and the collected data can be viewed there.
-
-## Cache library
-The cache library mainly uses the [shmop module](https://www.php.net/manual/en/book.shmop.php) of PHP. The current version acts as a library that can invoke the shmop functions to interact with cross-request cache. This requires the users to invoke the corresponding functions where they need the data cache. However, we are planing to implement in a more systematic way at the PHP interpreter level. This aims to achieve an adaptive data cache when the PHP interpreter observes any frequent data read.
-A list of helpful functions in this version:
-- getSHMKey ($path, $pj = "b"): to get a share memory key used to index cache data.
-- write($shmKey, $data, int $seconds = 0): serialize the data and write to the cache,
-- read($shmKey): read the data from cache
-- clean($shmKey): clean data cache
-
-TODO: adaptive data cache in interpreter
-
-### Use
-We provide a simple example to demonstrate the performance of our cache mechanism. For simplicity, we use a command line PHP code snippet.
-
-### Demo
-1. Install database systems and create a user `test`.
-	```txt
-	$servername = "localhost";
-	$username = "test";
-	$password = "123456";
-	```
-
-2. Import basic databse table data:
-    ```sh
-    $ cd utils/
-    $ mysql -u test -p < example/db.sql
-    # prompt to type password, 123456
-    # the data is successfully imported for testing.
-    ```
-3. We provide a simple case in `utils/example/example.php`. From this simple example, a significant time difference is observed.
-	```sh
-	# setup the database as specified above
-	$ cd utils/
-    $ php Main1.php example/example.php
-	$ php example/example.php
-	# This would output the time without FuzzCache
-    Using time (10000 rounds)
-    1.791738986969
-    
-    $ php example/example-fuzzcache.php
-	# This would output the time with FuzzCache
-    Using time (10000 rounds)
-    0.30018901824951
-	```
-	Note that the actual time would differ in different machines.
-
